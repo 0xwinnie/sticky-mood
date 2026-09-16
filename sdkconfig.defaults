@@ -1,0 +1,19 @@
+# Board facts for reTerminal Sticky (ESP32-S3R8, 32 MB flash, 8 MB octal PSRAM).
+# Getting FLASHSIZE or SPIRAM_MODE wrong loses address space / PSRAM.
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+
+# The 48 KB framebuffer and panel driver run from the main task in this design.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_FREERTOS_HZ=1000
+CONFIG_GPIO_CTRL_FUNC_IN_IRAM=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+CONFIG_IDF_EXPERIMENTAL_FEATURES=y
+
+# Networking is required for time sync and mood-log upload.
+# Remove these lines to build a fully offline image and save flash + power.
+CONFIG_ESP_WIFI_ENABLED=y

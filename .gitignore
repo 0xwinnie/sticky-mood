@@ -1,0 +1,29 @@
+# ESP-IDF
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+dependencies.lock
+
+# Build/delivery artifacts (regenerate with idf.py build + tools/build_assets.sh)
+dist/
+sticky-diag-dist/
+*.zip
+
+# Local secrets — NEVER commit (BYOK Qwen key, Wi-Fi creds). See docs/REQUIREMENTS.md D2.
+*.local
+secrets.*
+wifi_creds.h
+
+# PlatformIO (if you switch build systems)
+.pio/
+
+# Python / tooling
+__pycache__/
+*.pyc
+.venv/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
