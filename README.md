@@ -1,176 +1,117 @@
-# sticky-mood
+# sticky-mood · me.status
 
-Seeed **reTerminal Sticky**（3.97" 磁吸墨水屏，ESP32-S3）上的**触屏心情/状态记录** App 固件。
+> 一个跑在 **Seeed reTerminal Sticky**（3.97" 磁吸墨水屏，ESP32-S3）上的**触屏心情/状态记录**应用。
+> 每天 5 秒钟，对着墙上的墨水屏回答"今天感觉如何"。
 
-> **当前状态：硬件 bring-up，尚无任何心情记录逻辑。**
-> 现在编译出来的是一个验证屏：显示触摸坐标、手势、命中了哪个测试框、按键计数。
-> 目的是在写任何业务逻辑之前，先把"工具链 + 墨水屏 + 触摸变换 + 按键"这条最有风险的链路跑通。
-> 产品需求还是开放问题，见 [`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md)。
+![8 页流程（由固件同一份 UI 代码渲染）](docs/images/ui-flow.png)
 
-## 硬件
+**当前状态**：UI + 状态机 + 硬件诊断模式已完成，固件用 ESP-IDF 交叉编译通过；
+同一份 UI 代码在电脑上的**模拟器**里可点击走通全部 615 个状态。真机验证（SD / 麦克风 / 按键 / RTC）
+已做成内置诊断菜单，等待借测。
 
-| | |
-|---|---|
-| SoC | ESP32-S3R8，双核 LX7 @ 240 MHz |
-| 内存 | 8 MB octal PSRAM / 32 MB QSPI flash |
-| 屏幕 | 3.97" 墨水屏，SSD1677，原生 800×480 横屏，1-bit 黑白 + 4 级灰度 |
-| 触摸 | GT911 电容触摸（I2C0） |
-| 按键 | AI/电源（GPIO 4）、上（5）、下（6） |
-| 其他 | SHT40 温湿度、LSM6DS3TR-C IMU、PCF8563 RTC、PDM 麦克风、蜂鸣器、microSD |
-| 电源 | 750 mAh，BQ27220 电量计，BQ25616 充电，USB-C |
+---
 
-完整引脚映射、总线拓扑、电源自锁电路、刷新策略和已知歧义见 [`docs/HARDWARE.md`](docs/HARDWARE.md)。
+## 这是什么
 
-## 目录结构
+`me.status` 是一个**纯触屏**的心情与状态记录器，替代我在手机「健康」App 里记心情的习惯。
 
-```
-sticky-mood/
-  CMakeLists.txt          ESP-IDF 顶层工程
-  sdkconfig.defaults      板级事实（32MB flash、octal PSRAM 等），别改错
-  components/             vendored 驱动，见 components/VENDORED.md
-    seeed_epaper/           SSD1677 面板驱动（Seeed 官方）
-    gt911/                  电容触摸
-    bq27220/                电量计（已拷入，bring-up 未用）
-    button/                 Espressif iot_button（已拷入，bring-up 未用）
-    debug_logging/          墨水屏/触摸调试日志开关
-  main/
-    main.cpp              主循环：触摸/AI 键 -> 状态机 -> 渲染 -> 刷新策略
-    pin_config.h          全部 GPIO 定义
-    board/power.cpp       电源自锁（app_main 第一件事）
-    hardware/
-      sticky_display.cpp  面板 + PSRAM 帧缓冲 + 旋转（唯一的旋转实现处）+ blit_ui
-      sticky_touch.cpp    GT911 轮询任务 + 手势分类 + 匹配的坐标变换
-    ui/                   零 ESP-IDF 依赖的 UI 核心（host 模拟器编译同一份代码）
-      framebuffer.cpp     1-bit 480x800 画布
-      bitmap_font.cpp     点阵字库渲染（utf8 -> 字形 blit）
-      art.cpp             1-bit 精灵渲染
-      resources.cpp       字面/精灵名字表
-      layout.h            网格常量 + 字面枚举
-    pages/
-      pages.cpp           8 页渲染 + 热区 + 状态机（纯 C++）
-    app/
-      app_state.h         AppState（page/mood/energy/intention/...）
-      device_resources.cpp  从固件内嵌 blob 装载 Resources
-  assets/
-    fonts/                字体源文件（不烧进固件，只用来生成点阵字库），见 assets/fonts/README.md
-      manrope/              OFL 1.1
-      playpen-sans/         OFL 1.1
-      plus-jakarta-sans/    OFL 1.1
-      gensen-rounded/       中文：思源柔黑 GenSenRounded2 TC，OFL 1.1，GB2312 子集 M/B
-    src/                  猫插画高清线稿源（AI 出图，人工验收过）
-    1bit/                 23 个 1-bit 成品（11 猫 + 12 图标），进固件的就是这些
-    preview-contact-sheet.png  全部资产的验收拼版
-  tools/
-    art/                  资产管线：postprocess.py（线稿→1-bit）/ gen_icons.py / contact_sheet.py
-    font/                 make_font.py：字体 -> 点阵 blob（build/font_data）
-    sim/                  host 模拟器 + 网页可点击预览（build/sim/index.html）
-    build_assets.sh       生成固件要内嵌的 blob（idf.py build 前先跑）
-  docs/
-    HARDWARE.md           硬件参考（GPIO、总线拓扑、电源自锁、刷新策略、已知歧义）
-    REQUIREMENTS.md       需求与决议（权威需求来源）
-    FEASIBILITY.md        功能可行度分析（判定表、容量/功耗预算、spike 清单）
-    ASSET-SPEC.md         猫插画 / 图标 / 字体的交付规格
-    QUESTIONS-FOR-SEEED.md  给 Seeed（Lily）的问题清单 + 借测计划
-    design/mockup-8pages.png  设计稿存档
-```
+- 首页问 **"How are you today?"**，依次选 **心情 → 精力 → 今天的意向**，三步完成一次记录；
+- 记完进入 **Completed** 页并常驻待机，墨水屏断电也保留最后一帧——它是一块"今天的状态牌"；
+- 长按 AI 键可以**录一段语音笔记**，转成文字和录音一起存到 SD 卡，可回看最近三个月；
+- 全程 1-bit 黑白、圆体字 + 手绘猫咪插画，安静、无通知、不打扰。
 
-架构遵循官方推荐的分层：
+它不是手机 App 的复刻，而是一个**环境式（ambient）设备**：挂在墙上/冰箱上，抬眼就能看到、碰一下就能记，
+把"记录心情"从打开 App 的负担变成一个 5 秒的仪式。
+
+## 为什么做这个
+
+我在 iPhone「健康」里记心情坚持不下来：入口太深、步骤太多、记完没有任何反馈。
+我想验证一个假设——**把记录的摩擦降到接近零，并且让"记过"这件事被看见**，人就会坚持下去。
+
+墨水屏恰好适合：常显不耗电、没有通知和蓝光、天然"慢"，和"停下来关照自己一下"的产品气质吻合。
+Seeed 的 reTerminal Sticky 是一块带触摸、麦克风、SD 卡和电池的成品墨水屏开发板，
+让我可以**不画 PCB、不焊板子**，把精力全部放在产品体验和固件上。
+
+## 硬件清单
+
+整机就是一块开发板，无需额外焊接：
+
+| 部件 | 规格 | 用途 |
+|---|---|---|
+| **Seeed reTerminal Sticky** | ESP32-S3R8（双核 LX7 @240 MHz，8 MB PSRAM / 32 MB flash） | 主控 |
+| 墨水屏 | 3.97" SSD1677，原生 800×480，1-bit 黑白 + 4 级灰度 | 显示（竖屏 480×800 使用） |
+| 触摸 | GT911 电容触摸（I2C0） | 全部交互 |
+| 麦克风 | PDM 麦克风 | 语音笔记 |
+| 存储 | microSD（SPI，与屏幕共用 SPI2） | 心情记录 + 语音笔记持久化 |
+| RTC | PCF8563（I2C1） | 日期/时间 |
+| 电源 | 750 mAh 锂电 + BQ27220 电量计 + BQ25616 充电，USB-C | 供电 |
+| 按键 | AI/电源、上、下 | 电源 + 诊断模式入口 |
+
+另需：一张 microSD 卡（存数据）、一根 USB-C 线（烧录/供电）。
+完整 GPIO 映射、总线拓扑与电源自锁电路见 [`docs/HARDWARE.md`](docs/HARDWARE.md)。
+
+## 功能演示
+
+**① 8 页交互流程**（上图）。这张图不是设计稿，而是**固件里那份 UI 代码在电脑上真实渲染**出来的逐帧输出——
+设备烧录后画的就是这些像素。
+
+**② 可点击的网页模拟器**。同一份 C++ 页面代码被编译进一个 host 模拟器，它会**广度优先遍历整个状态机**
+（615 个可达状态），生成一个单文件、可点击的网页预览：`tools/sim/` → `build/sim/index.html`。
+也就是说，在没有真机的情况下，整套交互逻辑已经在电脑上被完整走查过一遍。
+
+**③ 全部视觉资产为 1-bit 手工管线产出**（11 只猫 + 12 个图标 + 中英文点阵字库）：
+
+![资产拼版](assets/preview-contact-sheet.png)
+
+**④ 真机照片 / 运行视频**：手上暂无实体机，正在向 Seeed 借测；
+借测回来后会把真机实拍和刷新过程视频补进这里。诊断模式（开机按住 UP 键）
+会把 SD / 麦克风 / RTC / 按键 / 触摸的实测结果直接显示在墨水屏上。
+
+## 技术说明
+
+**语言 / 框架**：C++（gnu++2b）+ **ESP-IDF v5.4** + FreeRTOS。
+显示与触摸复用 Playground Registry 里 `sticky-2048` 的开源驱动组件（`seeed_epaper`、`gt911`）。
+
+**固件架构**——最关键的一个设计是**把 UI 层做成零 ESP-IDF 依赖的纯 C++**：
 
 ```
-数据:  Touch/AI 键 -> pages::on_tap -> AppState -> pages::render -> FrameBuffer -> blit_ui -> Display
-输入:  Button/Touch -> AppEvent -> handle -> Page/Display
+main/ui      1-bit 帧缓冲 / 点阵字库 / 精灵渲染   （不 include 任何 ESP-IDF 头）
+main/pages   8 页渲染 + 热区 + 状态机            （纯 C++，只读 AppState）
+main/app     AppState、资源装载
+main/hardware  面板(旋转+反色) / 触摸(坐标反变换)
+main/diag    开机按住 UP 进入的服务模式：SD/麦克风/RTC/电源/按键/触摸 六项硬件自检
 ```
 
-两条硬规则：
+因为 UI 层不碰硬件，**同一份 `pages/*.cpp` 既能编译进固件、也能在电脑上编译**，
+于是才有了上面那个可点击模拟器——UI 逻辑的验证不依赖真机。
 
-- **页面只读 AppState，绝不直接碰硬件。**
-- **ISR 和驱动回调只投递事件。** 全刷耗时以秒计，在回调里刷面板会触发看门狗复位。
+几条硬规则：
 
-## 环境准备
+- **页面只读 AppState，绝不直接碰硬件**；输入统一走 `pages::on_tap` 事件。
+- **旋转与反色只实现在一处**（`StickyDisplay::draw_pixel` / `blit_ui`），触摸做匹配的反变换；
+  面板原生 800×480 横屏，软件旋转 270° + `mirror_x` 得到竖屏 480×800。
+- **刷新策略**：换页全刷、增量局部刷，每 20 次局部刷强制一次全刷压残影；
+  全刷耗时以秒计，绝不在 ISR/回调里调用。
+- **电源自锁**：`POWER_HOLD`(45) + `POWER_LOCK`(46) 脉冲锁存主电源轨，必须是 `app_main()` 第一句。
 
-本机已装好 **ESP-IDF v5.4**（`~/esp/esp-idf`，target esp32s3），本仓库的 bring-up 已编译通过。
+**资产管线**（`tools/`）：OFL 字体（Manrope / GenSenRounded2 等）→ 自研 1-bit 点阵 blob；
+AI 线稿 → 后处理成 1-bit 精灵；全部由 `tools/build_assets.sh` 生成、内嵌进固件。
 
-每个新 shell 里激活工具链：
+**构建**：
 
 ```bash
-. ~/esp/esp-idf/export.sh
-idf.py --version   # 应显示 ESP-IDF v5.4.x
-```
-
-v5.4 是官方 demo 和 registry CI 都声明的版本，别随意升。
-
-换机器重装时注意本机网络的两个坑（GitHub 大文件传输经常被 reset）：
-
-1. **主仓库从 gitee 镜像拉**：`git clone -b v5.4 https://gitee.com/EspressifSystems/esp-idf.git`，
-   然后 `./install.sh esp32s3`。
-2. **子模块必须改回 GitHub**：gitee 镜像的 `.gitmodules` 指向 gitee，而镜像的子模块仓库要账号，
-   会报 `could not read Username for 'https://gitee.com'`。用一次性的 URL 重写（不改 git config）：
-
-   ```bash
-   cd ~/esp/esp-idf
-   git -c url."https://github.com/".insteadOf="https://gitee.com/" \
-       submodule update --init <path>
-   ```
-
-   不要加 `--depth 1`：第三方仓库（cJSON、micro-ecc、Unity、CMock、spiffs、protobuf-c）
-   拒绝按 SHA 浅取（`upload-pack: not our ref`），全量克隆反而能成功。
-
-   编译必需的子模块：`mbedtls/mbedtls`、`lwip/lwip`、`esp_wifi/lib`、`esp_phy/lib`、
-   `esp_coex/lib`、`heap/tlsf`、`json/cJSON`、`mqtt/esp-mqtt`、`unity/unity`、`cmock/CMock`、
-   `spiffs/spiffs`、`protobuf-c/protobuf-c`、`bootloader/.../micro-ecc`。
-   蓝牙和 OpenThread 的库体积大且本项目不用，没拉 —— 因此构建时要带
-   `IDF_SKIP_CHECK_SUBMODULES=1`（见下）。
-
-## 构建与烧录
-
-```bash
-export IDF_SKIP_CHECK_SUBMODULES=1   # 没拉 BT / OpenThread 子模块，跳过 cmake 的全量子模块检查
-idf.py set-target esp32s3            # 只需第一次
+bash tools/build_assets.sh      # 生成字体/精灵 blob
+. ~/esp/esp-idf/export.sh       # ESP-IDF v5.4
 idf.py build
 idf.py -p /dev/cu.usbmodem* flash monitor
 ```
 
-bring-up 实测产物：app 镜像 **约 293 KB**（Flash Code 154 KB + Flash Data 58 KB，含 Wi-Fi 协议栈），
-DIRAM 用了 21%。字体和猫插画的预算对照见 `docs/FEASIBILITY.md`。
-
-macOS 上端口形如 `/dev/cu.usbmodem*`；Linux 是 `/dev/ttyUSB0` 或 `/dev/ttyACM0`；Windows 是 `COM5`。
-
-要发布到 Playground，构建时显式带版本号，让产物和声明的 release 一致：
-
-```bash
-idf.py -D PROJECT_VER=1.0.0 build
-```
-
-## 两个必知的坑
-
-**1. 电源自锁。** 设备不是"通电即常开"，主电源轨由锁存电路控制，固件负责拉高
-`POWER_HOLD`(45) 并脉冲 `POWER_LOCK`(46)。`board::power_on_hold()` 必须是 `app_main()`
-的第一句，否则松开电源键后设备立刻掉电，表现为黑屏或卡在重启循环。
-
-**2. 新增 .cpp 要加进 `main/CMakeLists.txt` 的 `SRCS`。** 忘加的话链接照样通过，
-代码静默不执行 —— 这是"我的页面怎么不刷新"最常见的原因。
-
-更多故障对照表见 `docs/HARDWARE.md`。
-
-## 屏幕方向
-
-当前是**竖屏 480×800**（原生 800×480 旋转 270° + `mirror_x = true`），
-因为这是在量产硬件上验证过、且显示与触摸变换互相匹配的组合。
-
-旋转只实现在 `StickyDisplay::draw_pixel()` 一处，触摸的反向变换在
-`StickyTouch::read_touch()` 一处。**改一个必须同时改另一个**，否则会出现
-"显示正常但触摸错位"。方向仍是待确认的需求项（`docs/REQUIREMENTS.md` Q5）。
-
-## 发布到 Sticky Playground
-
-社区固件走 [Seeed-Projects/reterminal-sticky-playground-registry](https://github.com/Seeed-Projects/reterminal-sticky-playground-registry)：
-在 `firmwares/<id>/` 下提交 `firmware.json` + `README.md` + `assets/preview.jpg` +
-可构建的 `source/`，CI 用 ESP-IDF 构建并打包，合并后发布 Release，
-用户在 [Firmware 页面](https://www.seeedstudio.com/sticky/playground/firmware/) 用浏览器直接烧录。
-
-Registry 支持 ESP-IDF / PlatformIO / Arduino 三种构建方式，本项目用 ESP-IDF。
+更多细节：[`docs/HARDWARE.md`](docs/HARDWARE.md)（硬件/引脚/刷新）、
+[`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md)（需求与决议）、
+[`docs/FEASIBILITY.md`](docs/FEASIBILITY.md)（可行度与功耗预算）、
+[`docs/QUESTIONS-FOR-SEEED.md`](docs/QUESTIONS-FOR-SEEED.md)（待验证的硬件问题清单）。
 
 ## 许可证
 
-MIT，见 [LICENSE](LICENSE)。`components/` 下的第三方代码保留其各自许可证，
-见 [components/VENDORED.md](components/VENDORED.md)。
+MIT，见 [LICENSE](LICENSE)。`components/` 下第三方代码保留各自许可证，见 [components/VENDORED.md](components/VENDORED.md)。
+字体与插画均为 OFL / 自制，见 [`assets/fonts/README.md`](assets/fonts/README.md)。
