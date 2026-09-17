@@ -1,8 +1,10 @@
 idf_component_register(
     SRCS "main.cpp"
          "app/device_resources.cpp"
+         "app/record_store.cpp"
          "board/power.cpp"
          "board/storage.cpp"
+         "board/fatfs_record_store.cpp"
          "diag/diag.cpp"
          "diag/spikes.cpp"
          "hardware/sticky_display.cpp"

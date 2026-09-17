@@ -2,6 +2,7 @@
 #include "app/device_resources.h"
 #include "board/power.h"
 #include "board/storage.h"
+#include "board/fatfs_record_store.h"
 #include "diag/diag.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -92,6 +93,10 @@ extern "C" void app_main()
     // Mount it early so the journal is ready before any page can save.
     if (!board::storage_init()) {
         ESP_LOGE(kTag, "Internal storage mount failed; recording disabled");
+    } else {
+        board::FatfsRecordStore store;
+        ESP_LOGI(kTag, "record store ready: %d records, %lld KB free at %s", store.count(),
+                 (long long)(store.free_bytes() / 1024), store.path());
     }
 
     StickyDisplay display;
