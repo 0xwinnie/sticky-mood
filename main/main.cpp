@@ -81,6 +81,10 @@ extern "C" void app_main()
     board::power_on_hold();
     ESP_LOGI(kTag, "Power rail latched");
 
+    // The e-paper driver registers a BUSY-pin ISR handler; the ISR service must
+    // exist first or init logs "GPIO isr service is not installed".
+    gpio_install_isr_service(0);
+
     init_ai_button();
 
     StickyDisplay display;

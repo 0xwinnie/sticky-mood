@@ -206,3 +206,10 @@ void StickyDisplay::panel_sleep()
         seeed_epaper_panel_sleep(panel_);
     }
 }
+
+void StickyDisplay::set_panel_power(bool on)
+{
+    // EN was configured as an output by the panel driver; drive it directly to
+    // isolate (or restore) the panel on the shared SPI2 bus.
+    gpio_set_level(static_cast<gpio_num_t>(PIN_EPD_EN), on ? 1 : 0);
+}

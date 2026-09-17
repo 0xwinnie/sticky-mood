@@ -42,6 +42,12 @@ public:
     // stays visible while the device is powered down.
     void panel_sleep();
 
+    // Cuts/restores panel power (EN, GPIO 47). Unpowering tri-states the panel's
+    // MISO so the shared SPI2 bus is electrically clean for the microSD card.
+    // After restoring power the panel must be re-prepared; the next refresh_*()
+    // call does that. Used by the SD diagnostic to rule out bus contention.
+    void set_panel_power(bool on);
+
 private:
     bool refresh(seeed_epaper_refresh_mode_t mode);
 

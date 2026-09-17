@@ -73,11 +73,11 @@ uint8_t *psram_alloc(size_t bytes)
 }
 
 // --- shared SD mount (SPI2 is already up from StickyDisplay::init) ---
-sdmmc_card_t *sd_mount(char *err, size_t errlen)
+sdmmc_card_t *sd_mount(char *err, size_t errlen, int freq_khz)
 {
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
     host.slot = SPI2_HOST;
-    host.max_freq_khz = 10000;  // assumption A3: same 10 MHz as the panel
+    host.max_freq_khz = freq_khz;  // SDSPI range 400 kHz - 20 MHz
 
     sdspi_device_config_t slot = SDSPI_DEVICE_CONFIG_DEFAULT();
     slot.gpio_cs = static_cast<gpio_num_t>(PIN_SD_CS);
@@ -104,64 +104,25 @@ void sd_unmount(sdmmc_card_t *card)
     }
 }
 
-int bcd(int v)
+// 1 MB write / read / byte-verify against an already-mounted /sdcard.
+bool sd_rw_test(Lines &out)
 {
-    return ((v >> 4) & 0x0F) * 10 + (v & 0x0F);
-}
-
-}  // namespace
-
-// ---------------------------------------------------------------------------
-// S1b: microSD on the shared SPI2 bus (QUESTIONS A1-A6)
-// ---------------------------------------------------------------------------
-void spike_sd(DiagUi &ui)
-{
-    Lines busy;
-    busy.add("Mounting /sdcard ...");
-    busy.add("If this hangs, suspect A2/A6");
-    busy.present(ui, "SD CARD");
-
-    char err[48];
-    sdmmc_card_t *card = sd_mount(err, sizeof err);
-
-    Lines out;
-    if (card == nullptr) {
-        ESP_LOGE(kTag, "SD mount failed: %s", err);
-        out.add("Mount FAILED: %s", err);
-        out.add("Likely A2 (no power EN),");
-        out.add("A3 (clock) or no card.");
-        out.add("Retrying at 400 kHz may help.");
-        out.present(ui, "SD CARD");
-        wait_exit(ui);
-        return;
-    }
-
-    uint64_t total = 0, fre = 0;
-    esp_vfs_fat_info("/sdcard", &total, &fre);
-    out.add("Mount OK @10 MHz");
-    out.add("Total %llu MB  Free %llu MB",
-            (unsigned long long)(total / (1024 * 1024)),
-            (unsigned long long)(fre / (1024 * 1024)));
-    ESP_LOGI(kTag, "SD mounted: total=%llu free=%llu", (unsigned long long)total, (unsigned long long)fre);
-
     constexpr size_t kChunk = 32 * 1024;
-    constexpr size_t kTotal = 1024 * 1024;  // 1 MB
+    constexpr size_t kTotal = 1024 * 1024;
     uint8_t *buf = psram_alloc(kChunk);
     if (buf == nullptr) {
         out.add("Buffer alloc FAILED");
-        out.present(ui, "SD CARD");
-        sd_unmount(card);
-        wait_exit(ui);
-        return;
+        return false;
     }
 
     bool verify_ok = true;
     size_t fail_off = 0;
+    int write_ms = 0, read_ms = 0;
 
     FILE *f = fopen("/sdcard/diag.bin", "wb");
-    int write_ms = 0, read_ms = 0;
     if (f == nullptr) {
         out.add("Open for write FAILED");
+        verify_ok = false;
     } else {
         const int64_t t0 = now_ms();
         size_t off = 0;
@@ -224,28 +185,202 @@ void spike_sd(DiagUi &ui)
     } else {
         out.add("Verify: FAIL @%u", (unsigned)fail_off);
     }
-    out.add("Panel+SD concurrency: run a");
-    out.add("refresh during next test (A5).");
+    ESP_LOGI(kTag, "SD rw: write=%dms read=%dms verify=%d", write_ms, read_ms, verify_ok ? 1 : 0);
+    return verify_ok;
+}
 
-    ESP_LOGI(kTag, "SD result: write=%dms read=%dms verify=%d", write_ms, read_ms, verify_ok ? 1 : 0);
-    sd_unmount(card);
+int bcd(int v)
+{
+    return ((v >> 4) & 0x0F) * 10 + (v & 0x0F);
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// S1b: microSD on the shared SPI2 bus (QUESTIONS A1-A6)
+//
+// Lily's borrow test reported ESP_ERR_INVALID_RESPONSE / ESP_ERR_TIMEOUT on
+// init, and noted the screen misbehaving once a card was inserted. Both point
+// at the e-paper panel and the card fighting over the shared SPI2 bus.
+// Instead of guessing one config, sweep the two variables that matter:
+//   (a) whether the panel is powered down during the SD transaction, and
+//   (b) the SPI clock, starting slow (400 kHz) and climbing.
+// The first combination that mounts AND passes the 1 MB read/verify wins, and
+// we report it so the next firmware can hard-code that exact setup.
+// ---------------------------------------------------------------------------
+void spike_sd(DiagUi &ui)
+{
+    Lines busy;
+    busy.add("Sweeping isolation x clock ...");
+    busy.add("Panel is toggled per attempt.");
+    busy.present(ui, "SD CARD");
+
+    Lines out;
+    const int khz[4] = {400, 1000, 4000, 10000};
+    int win_khz = 0;
+    bool win_isolate = false;
+    bool win_ok = false;
+
+    // isolate=true powers the panel off (tri-states its MISO) for the probe.
+    for (int iso = 0; iso < 2 && !win_ok; ++iso) {
+        const bool isolate = (iso == 1);
+        ui.display->set_panel_power(!isolate);
+
+        for (int k = 0; k < 4; ++k) {
+            char err[48];
+            err[0] = '\0';
+            sdmmc_card_t *card = sd_mount(err, sizeof err, khz[k]);
+            if (card == nullptr) {
+                ESP_LOGW(kTag, "SD iso=%d @%dkHz mount failed: %s", isolate ? 1 : 0, khz[k], err);
+                out.add("iso=%d %5dkHz: %s", isolate ? 1 : 0, khz[k], err);
+                out.present(ui, "SD CARD");
+                continue;
+            }
+
+            uint64_t total = 0, fre = 0;
+            esp_vfs_fat_info("/sdcard", &total, &fre);
+            Lines rw;
+            const bool ok = sd_rw_test(rw);
+            out.add("iso=%d %5dkHz: MOUNT OK", isolate ? 1 : 0, khz[k]);
+            out.add("  total %lluMB free %lluMB",
+                    (unsigned long long)(total / (1024 * 1024)),
+                    (unsigned long long)(fre / (1024 * 1024)));
+            for (int i = 0; i < rw.n; ++i) {
+                out.add("  %s", rw.b[i]);
+            }
+            out.present(ui, "SD CARD");
+            sd_unmount(card);
+
+            if (ok && !win_ok) {
+                win_ok = true;
+                win_khz = khz[k];
+                win_isolate = isolate;
+                break;
+            }
+        }
+    }
+
+    // Restore the panel so the menu renders again.
+    ui.display->set_panel_power(true);
+
+    if (win_ok) {
+        out.add("WINNER: isolate=%d  %d kHz", win_isolate ? 1 : 0, win_khz);
+        out.add("Hard-code this in the app.");
+        ESP_LOGI(kTag, "SD winner: isolate=%d khz=%d", win_isolate ? 1 : 0, win_khz);
+    } else {
+        out.add("No combination worked.");
+        out.add("Suspect A2 (power EN), A3,");
+        out.add("or card absent/faulty.");
+        ESP_LOGE(kTag, "SD: all isolate x clock combos failed");
+    }
     out.present(ui, "SD CARD");
     wait_exit(ui);
 }
 
 // ---------------------------------------------------------------------------
 // S2: PDM microphone capture (QUESTIONS B1-B4)
+//
+// Lily's borrow test logged samples=80000 rms=30934 peak=32768 twice, byte for
+// byte identical. That is a saturated / hi-Z line: the PDM decoder is reading
+// a slot the mic never drives, so it latches all-ones. The two unknowns are
+// which PDM slot the mic is on (LEFT = select pin low, RIGHT = select pin high)
+// and whether the bit clock needs inverting. Sweep both with a short probe,
+// keep the configuration whose signal is loudest WITHOUT being pinned at full
+// scale, then do the real 5 s capture and drop a WAV on the SD card.
 // ---------------------------------------------------------------------------
+namespace {
+
+struct MicStat {
+    bool init_ok = false;
+    size_t samples = 0;
+    int rms = 0;
+    int32_t peak = 0;
+};
+
+// Capture `seconds` at 16 kHz mono with the given slot/clk_inv, report stats.
+MicStat mic_probe(uint32_t slot_mask, bool clk_inv, float seconds, int16_t *pcm, size_t cap_samples)
+{
+    MicStat st;
+    i2s_chan_handle_t rx = nullptr;
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    esp_err_t ret = i2s_new_channel(&chan_cfg, nullptr, &rx);
+    if (ret != ESP_OK) {
+        return st;
+    }
+
+    i2s_pdm_rx_config_t pdm = {};
+    pdm.clk_cfg = I2S_PDM_RX_CLK_DEFAULT_CONFIG(16000);
+    pdm.slot_cfg = I2S_PDM_RX_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO);
+    pdm.slot_cfg.slot_mask = static_cast<i2s_pdm_slot_mask_t>(slot_mask);
+    pdm.gpio_cfg.clk = static_cast<gpio_num_t>(PIN_MIC_CLK);
+    pdm.gpio_cfg.din = static_cast<gpio_num_t>(PIN_MIC_DATA);
+    pdm.gpio_cfg.invert_flags.clk_inv = clk_inv;
+    ret = i2s_channel_init_pdm_rx_mode(rx, &pdm);
+    if (ret != ESP_OK) {
+        i2s_del_channel(rx);
+        return st;
+    }
+    st.init_ok = true;
+
+    const size_t want_samples = (size_t)(16000 * seconds);
+    const size_t total = want_samples < cap_samples ? want_samples : cap_samples;
+    const size_t total_bytes = total * 2;
+
+    i2s_channel_enable(rx);
+    size_t got = 0;
+    const int64_t t0 = now_ms();
+    while (got < total_bytes) {
+        size_t want = total_bytes - got;
+        if (want > 4096) {
+            want = 4096;
+        }
+        size_t br = 0;
+        if (i2s_channel_read(rx, reinterpret_cast<char *>(pcm) + got, want, &br, 1000) != ESP_OK) {
+            break;
+        }
+        got += br;
+        if (br == 0 && now_ms() - t0 > (int64_t)(seconds * 1000) + 2000) {
+            break;
+        }
+    }
+    i2s_channel_disable(rx);
+    i2s_del_channel(rx);
+
+    st.samples = got / 2;
+    int64_t sumsq = 0;
+    int32_t peak = 0;
+    for (size_t i = 0; i < st.samples; ++i) {
+        const int32_t s = pcm[i];
+        sumsq += (int64_t)s * s;
+        const int32_t a = s < 0 ? -s : s;
+        if (a > peak) {
+            peak = a;
+        }
+    }
+    st.peak = peak;
+    if (st.samples > 0) {
+        const int64_t mean = sumsq / (int64_t)st.samples;
+        int64_t r = mean > 0 ? mean : 1;
+        for (int i = 0; i < 24; ++i) {
+            r = (r + mean / r) / 2;
+        }
+        st.rms = (int)r;
+    }
+    return st;
+}
+
+}  // namespace
+
 void spike_mic(DiagUi &ui)
 {
     Lines busy;
-    busy.add("Capturing 5 s @16 kHz mono");
-    busy.add("SPEAK NOW ...");
+    busy.add("Probing slot x clk_inv ...");
+    busy.add("Make some noise!");
     busy.present(ui, "MICROPHONE");
 
-    constexpr uint32_t kRate = 16000;
-    constexpr size_t kBytes = kRate * 2 * 5;  // 5 s of 16-bit mono = 160000
-    int16_t *pcm = reinterpret_cast<int16_t *>(psram_alloc(kBytes));
+    // 5 s of 16-bit mono = 160000 bytes.
+    constexpr size_t kCapSamples = 16000 * 5;
+    int16_t *pcm = reinterpret_cast<int16_t *>(psram_alloc(kCapSamples * 2));
 
     Lines out;
     if (pcm == nullptr) {
@@ -255,86 +390,68 @@ void spike_mic(DiagUi &ui)
         return;
     }
 
-    i2s_chan_handle_t rx = nullptr;
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    esp_err_t ret = i2s_new_channel(&chan_cfg, nullptr, &rx);
-    if (ret == ESP_OK) {
-        i2s_pdm_rx_config_t pdm = {};
-        pdm.clk_cfg = I2S_PDM_RX_CLK_DEFAULT_CONFIG(kRate);
-        pdm.slot_cfg = I2S_PDM_RX_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO);
-        pdm.gpio_cfg.clk = static_cast<gpio_num_t>(PIN_MIC_CLK);
-        pdm.gpio_cfg.din = static_cast<gpio_num_t>(PIN_MIC_DATA);
-        pdm.gpio_cfg.invert_flags.clk_inv = false;
-        ret = i2s_channel_init_pdm_rx_mode(rx, &pdm);
+    struct Cfg {
+        uint32_t mask;
+        bool inv;
+        const char *name;
+    };
+    const Cfg cfgs[4] = {
+        {I2S_PDM_SLOT_RIGHT, false, "R inv0"},
+        {I2S_PDM_SLOT_RIGHT, true, "R inv1"},
+        {I2S_PDM_SLOT_LEFT, false, "L inv0"},
+        {I2S_PDM_SLOT_LEFT, true, "L inv1"},
+    };
+
+    int best = -1;
+    int best_rms = -1;
+    for (int c = 0; c < 4; ++c) {
+        const MicStat st = mic_probe(cfgs[c].mask, cfgs[c].inv, 1.0f, pcm, kCapSamples);
+        if (!st.init_ok) {
+            out.add("%s: init FAILED", cfgs[c].name);
+            out.present(ui, "MICROPHONE");
+            continue;
+        }
+        // Pinned at full scale = saturated/dead line, not real audio.
+        const bool saturated = (st.peak >= 32767 && st.rms > 20000);
+        out.add("%s: rms=%d peak=%d%s", cfgs[c].name, st.rms, (int)st.peak,
+                saturated ? " SAT" : "");
+        out.present(ui, "MICROPHONE");
+        ESP_LOGI(kTag, "mic probe %s rms=%d peak=%d sat=%d", cfgs[c].name, st.rms, (int)st.peak,
+                 saturated ? 1 : 0);
+        if (!saturated && st.rms > best_rms) {
+            best_rms = st.rms;
+            best = c;
+        }
     }
 
-    if (ret != ESP_OK) {
-        ESP_LOGE(kTag, "PDM RX init failed: %s", esp_err_to_name(ret));
-        out.add("I2S PDM init FAILED: %s", esp_err_to_name(ret));
-        out.add("Check B2 (slot/clk config).");
-        if (rx) {
-            i2s_del_channel(rx);
-        }
+    if (best < 0) {
+        out.add("No clean slot found.");
+        out.add("All saturated/dead: check");
+        out.add("B1 (mic power) / B3 (wiring).");
+        ESP_LOGE(kTag, "mic: no non-saturated slot config");
         heap_caps_free(pcm);
         out.present(ui, "MICROPHONE");
         wait_exit(ui);
         return;
     }
 
-    i2s_channel_enable(rx);
-    size_t got = 0;
-    const int64_t t0 = now_ms();
-    while (got < kBytes) {
-        size_t want = kBytes - got;
-        if (want > 4096) {
-            want = 4096;
-        }
-        size_t br = 0;
-        if (i2s_channel_read(rx, reinterpret_cast<char *>(pcm) + got, want, &br, 1000) != ESP_OK) {
-            break;
-        }
-        got += br;
-        if (br == 0 && now_ms() - t0 > 7000) {
-            break;  // no data flowing
-        }
-    }
-    i2s_channel_disable(rx);
-    i2s_del_channel(rx);
-    const int elapsed = (int)(now_ms() - t0);
+    out.add("WINNER: %s", cfgs[best].name);
+    out.add("Capturing 5 s ... SPEAK NOW");
+    out.present(ui, "MICROPHONE");
 
-    const size_t samples = got / 2;
-    int64_t sumsq = 0;
-    int32_t peak = 0;
-    for (size_t i = 0; i < samples; ++i) {
-        const int32_t s = pcm[i];
-        sumsq += (int64_t)s * s;
-        const int32_t a = s < 0 ? -s : s;
-        if (a > peak) {
-            peak = a;
-        }
-    }
-    int rms = 0;
-    if (samples > 0) {
-        const int64_t mean = sumsq / (int64_t)samples;
-        // Integer Newton sqrt of the mean square.
-        int64_t r = mean > 0 ? mean : 1;
-        for (int i = 0; i < 24; ++i) {
-            r = (r + mean / r) / 2;
-        }
-        rms = (int)r;
-    }
-
-    out.add("Captured %u samples (%d ms)", (unsigned)samples, elapsed);
-    out.add("RMS %d   Peak %d", rms, (int)peak);
-    out.add(rms > 300 ? "Mic looks ALIVE (>300)" : "Quiet/dead: check B1/B3");
+    const MicStat cap = mic_probe(cfgs[best].mask, cfgs[best].inv, 5.0f, pcm, kCapSamples);
+    out.add("Captured %u samples", (unsigned)cap.samples);
+    out.add("RMS %d   Peak %d", cap.rms, (int)cap.peak);
+    out.add(cap.rms > 300 ? "Mic looks ALIVE (>300)" : "Quiet: check gain/B1");
 
     // Save a WAV so the recording can be fed to Qwen ASR (V4).
     char err[48];
-    sdmmc_card_t *card = sd_mount(err, sizeof err);
-    if (card != nullptr && samples > 0) {
+    err[0] = '\0';
+    sdmmc_card_t *card = sd_mount(err, sizeof err, 4000);
+    if (card != nullptr && cap.samples > 0) {
         FILE *f = fopen("/sdcard/diag_mic.wav", "wb");
         if (f != nullptr) {
-            const uint32_t data_bytes = (uint32_t)(samples * 2);
+            const uint32_t data_bytes = (uint32_t)(cap.samples * 2);
             uint8_t hdr[44];
             memcpy(hdr, "RIFF", 4);
             uint32_t riff = data_bytes + 36;
@@ -345,9 +462,9 @@ void spike_mic(DiagUi &ui)
             uint16_t audio = 1, ch = 1, bits = 16;
             memcpy(hdr + 20, &audio, 2);
             memcpy(hdr + 22, &ch, 2);
-            uint32_t rate = kRate;
+            uint32_t rate = 16000;
             memcpy(hdr + 24, &rate, 4);
-            uint32_t byterate = kRate * 2;
+            uint32_t byterate = 16000 * 2;
             memcpy(hdr + 28, &byterate, 4);
             uint16_t align = 2;
             memcpy(hdr + 32, &align, 2);
@@ -366,7 +483,8 @@ void spike_mic(DiagUi &ui)
         out.add("WAV skipped: SD %s", err);
     }
 
-    ESP_LOGI(kTag, "mic result: samples=%u rms=%d peak=%d elapsed=%dms", (unsigned)samples, rms, (int)peak, elapsed);
+    ESP_LOGI(kTag, "mic result: slot=%s samples=%u rms=%d peak=%d", cfgs[best].name,
+             (unsigned)cap.samples, cap.rms, (int)cap.peak);
     heap_caps_free(pcm);
     out.present(ui, "MICROPHONE");
     wait_exit(ui);
@@ -374,7 +492,48 @@ void spike_mic(DiagUi &ui)
 
 // ---------------------------------------------------------------------------
 // S4: PCF8563 RTC on the sensor I2C1 bus (QUESTION C6)
+//
+// Lily's borrow test read back "2045-11-36 33:32:45 VL=1". VL=1 means the
+// clock lost power (no/flat backup cell), so the registers are garbage -- but
+// that also proves we cannot tell a wiring fault from a merely-unset clock
+// just by reading. So: read first; if VL is set OR the fields are out of
+// range, write a known timestamp (clears VL), read it back, and wait a second
+// to confirm the seconds counter is actually advancing. A clean re-read means
+// I2C comms are good and the chip just needed setting; a failed re-read means
+// real comms trouble.
 // ---------------------------------------------------------------------------
+namespace {
+
+bool rtc_fields_sane(const uint8_t *t)
+{
+    const int sec = bcd(t[0] & 0x7F);
+    const int min = bcd(t[1] & 0x7F);
+    const int hour = bcd(t[2] & 0x3F);
+    const int day = bcd(t[3] & 0x3F);
+    const int mon = bcd(t[5] & 0x1F);
+    return sec <= 59 && min <= 59 && hour <= 23 && day >= 1 && day <= 31 &&
+           mon >= 1 && mon <= 12;
+}
+
+// Write seconds..years (reg 0x02..0x08) in BCD, VL cleared.
+esp_err_t rtc_seed(i2c_master_dev_handle_t dev, int year, int mon, int day, int hour, int min,
+                   int sec)
+{
+    auto to_bcd = [](int v) { return (uint8_t)(((v / 10) << 4) | (v % 10)); };
+    uint8_t buf[8];
+    buf[0] = 0x02;          // start register
+    buf[1] = to_bcd(sec);   // seconds, VL bit = 0
+    buf[2] = to_bcd(min);
+    buf[3] = to_bcd(hour);
+    buf[4] = to_bcd(day);
+    buf[5] = 0x00;          // weekday
+    buf[6] = to_bcd(mon);   // month, century bit = 0 (20xx)
+    buf[7] = to_bcd(year);
+    return i2c_master_transmit(dev, buf, sizeof buf, pdMS_TO_TICKS(200));
+}
+
+}  // namespace
+
 void spike_rtc(DiagUi &ui)
 {
     Lines out;
@@ -409,27 +568,77 @@ void spike_rtc(DiagUi &ui)
         return;
     }
 
-    uint8_t reg = 0x02;  // VL_seconds .. years (7 bytes)
+    // --- first read ---
+    uint8_t reg = 0x02;
     uint8_t t[7] = {0};
     ret = i2c_master_transmit_receive(dev, &reg, 1, t, sizeof t, pdMS_TO_TICKS(200));
     if (ret != ESP_OK) {
         out.add("Read FAILED: %s", esp_err_to_name(ret));
         out.add("No ACK -> wrong addr/wiring.");
+        ESP_LOGE(kTag, "RTC read failed: %s", esp_err_to_name(ret));
+        i2c_master_bus_rm_device(dev);
+        i2c_del_master_bus(bus);
+        out.present(ui, "RTC");
+        wait_exit(ui);
+        return;
+    }
+
+    const bool vl = (t[0] & 0x80) != 0;
+    const bool sane = rtc_fields_sane(t);
+    out.add("1st read: 20%02d-%02d-%02d %02d:%02d:%02d", bcd(t[6]), bcd(t[5] & 0x1F),
+            bcd(t[3] & 0x3F), bcd(t[2] & 0x3F), bcd(t[1] & 0x7F), bcd(t[0] & 0x7F));
+    out.add("VL=%d  fields %s", vl ? 1 : 0, sane ? "sane" : "INVALID");
+    ESP_LOGI(kTag, "RTC 1st read VL=%d sane=%d", vl ? 1 : 0, sane ? 1 : 0);
+
+    if (!vl && sane) {
+        out.add("Clock already valid; nothing");
+        out.add("to seed. Backup cell present.");
+        i2c_master_bus_rm_device(dev);
+        i2c_del_master_bus(bus);
+        out.present(ui, "RTC");
+        wait_exit(ui);
+        return;
+    }
+
+    // --- seed a known timestamp and prove comms by re-reading ---
+    out.add("Seeding 2026-01-01 00:00:00 ...");
+    out.present(ui, "RTC");
+    const esp_err_t wret = rtc_seed(dev, 26, 1, 1, 0, 0, 0);
+    if (wret != ESP_OK) {
+        out.add("WRITE FAILED: %s", esp_err_to_name(wret));
+        out.add("-> I2C comms really broken.");
+        ESP_LOGE(kTag, "RTC seed write failed: %s", esp_err_to_name(wret));
+        i2c_master_bus_rm_device(dev);
+        i2c_del_master_bus(bus);
+        out.present(ui, "RTC");
+        wait_exit(ui);
+        return;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(1100));  // let it tick ~1 s
+    uint8_t t2[7] = {0};
+    reg = 0x02;
+    ret = i2c_master_transmit_receive(dev, &reg, 1, t2, sizeof t2, pdMS_TO_TICKS(200));
+    if (ret != ESP_OK) {
+        out.add("Re-read FAILED: %s", esp_err_to_name(ret));
     } else {
-        const int sec = bcd(t[0] & 0x7F);
-        const int min = bcd(t[1] & 0x7F);
-        const int hour = bcd(t[2] & 0x3F);
-        const int day = bcd(t[3] & 0x3F);
-        const int mon = bcd(t[5] & 0x1F);
-        const int year = bcd(t[6]);
-        const bool vl = (t[0] & 0x80) != 0;
-        out.add("PCF8563 @0x51 on I2C1");
-        out.add("20%02d-%02d-%02d  %02d:%02d:%02d", year, mon, day, hour, min, sec);
-        out.add(vl ? "VL=1 clock was LOST" : "VL=0 clock valid");
-        out.add(vl ? "-> no backup cell (C6)" : "-> backup cell present");
-        out.add("Power-cycle & re-run to");
-        out.add("measure drift / VL change.");
-        ESP_LOGI(kTag, "RTC 20%02d-%02d-%02d %02d:%02d:%02d VL=%d", year, mon, day, hour, min, sec, vl ? 1 : 0);
+        const bool vl2 = (t2[0] & 0x80) != 0;
+        out.add("After seed: 20%02d-%02d-%02d %02d:%02d:%02d", bcd(t2[6]), bcd(t2[5] & 0x1F),
+                bcd(t2[3] & 0x3F), bcd(t2[2] & 0x3F), bcd(t2[1] & 0x7F), bcd(t2[0] & 0x7F));
+        out.add("VL=%d", vl2 ? 1 : 0);
+        const int sec2 = bcd(t2[0] & 0x7F);
+        if (!vl2 && sec2 >= 1 && sec2 <= 5) {
+            out.add("Counter TICKING -> I2C OK.");
+            out.add("Was unset/no backup cell.");
+        } else if (!vl2) {
+            out.add("Set but seconds=%d (odd);", sec2);
+            out.add("check tick / crystal.");
+        } else {
+            out.add("VL still 1 -> no backup");
+            out.add("cell; clock will reset on");
+            out.add("every power loss (C6).");
+        }
+        ESP_LOGI(kTag, "RTC after seed VL=%d sec=%d", vl2 ? 1 : 0, sec2);
     }
 
     i2c_master_bus_rm_device(dev);
