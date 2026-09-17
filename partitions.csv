@@ -1,0 +1,13 @@
+# Custom partition table for sticky-mood (32 MB flash).
+#
+# Layout decision (2026-09-17): internal flash is the PRIMARY store for mood
+# records (mood + energy + intention + timestamp + transcribed text). The card
+# is only for raw audio and optional export, so the core journal must work with
+# no SD inserted. A dedicated 4 MB FATFS data partition ("storage") holds those
+# records; ~25 MB of flash is still left unallocated for later growth.
+#
+# Name,    Type, SubType, Offset,   Size,  Flags
+nvs,       data, nvs,     0x9000,   0x6000,
+phy_init,  data, phy,     0xf000,   0x1000,
+factory,   app,  factory, 0x10000,  1500K,
+storage,   data, fat,     0x187000, 4M,

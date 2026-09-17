@@ -1,6 +1,7 @@
 #include "app/app_state.h"
 #include "app/device_resources.h"
 #include "board/power.h"
+#include "board/storage.h"
 #include "diag/diag.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -86,6 +87,12 @@ extern "C" void app_main()
     gpio_install_isr_service(0);
 
     init_ai_button();
+
+    // Internal flash is the PRIMARY mood-record store (works with no SD card).
+    // Mount it early so the journal is ready before any page can save.
+    if (!board::storage_init()) {
+        ESP_LOGE(kTag, "Internal storage mount failed; recording disabled");
+    }
 
     StickyDisplay display;
     if (!display.init()) {
